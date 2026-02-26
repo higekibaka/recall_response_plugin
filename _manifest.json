@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "撤回消息响应插件",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "检测群聊撤回事件，有概率让麦麦发出一句符合人设的自然反应",
   "author": {
     "name": "higekibaka",
@@ -17,7 +17,7 @@
     "撤回",
     "群组",
     "互动",
-    "LLM"
+    "梗"
   ],
   "categories": [
     "Entertainment & Interaction"

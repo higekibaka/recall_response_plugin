@@ -1,17 +1,20 @@
 """
-撤回消息响应插件 (recall_response_plugin) 
+撤回消息响应插件 (recall_response_plugin)
 ==========================================
 
 功能：
-    监听群聊中的消息撤回事件，按照概率格式化输出对撤回事件的调侃反应。
-    反应格式固定为：{撤回人名称}：{十个字左右的动作描述}（{绝望/开心}地撤回）
-    其中"动作描述"由 LLM 通过官方 generator_api 结合人设和群聊上下文生成。
+    监听群聊中的消息撤回事件，按照概率格式化输出对撤回事件的定型文调侃。
+    反应格式固定为：{撤回人名称}：{动作描述}（{绝望/开心}地撤回）
+    动作描述来源：
+      - 若 config 中配置了 fixed_responses 列表，则从中随机选取一条（定型文模式，无 LLM）
+      - 否则通过官方 generator_api 用 replyer 模型动态生成（LLM 模式）
 
 工作原理：
     1. 通过 ON_MESSAGE_PRE_PROCESS 事件钩子，拦截所有进入系统的消息（含 notice 类型）
     2. 检测消息段（message_segments）中类型为 "notify"、sub_type 为 "recall" 的段
-    3. 满足条件后：概率抽签 → 冷却检查 → 根据概率确定状态后缀 → 调用 generator_api 生成动作描述 → 拼接格式发送
-    4. 全程异步执行，不阻塞消息的正常处理流程
+    3. 优先显示「被撤回消息的原作者」名称；若管理员替他人撤回则仍显示原作者，而非管理员
+    4. 概率抽签 → 冷却检查 → 确定状态后缀 → 选取/生成动作描述 → 拼格式发送
+    5. 全程异步执行，不阻塞消息的正常处理流程
 
 注意：
     - 本插件 **不修改任何 core 代码**，完全通过插件系统实现
@@ -130,14 +133,23 @@ class RecallEventHandler(BaseEventHandler):
         QQ 的撤回通知经过 maim_message 协议转换后，结构如下：
             message.message_segments[0].type = "notify"
             message.message_segments[0].data = {
-                "sub_type": "group_recall",   # Napcat 发来的实际字段
-                "message_id": "<被撤回的消息 ID>",
-                "recalled_user_info": { "user_id": ..., "user_nickname": ... }  # 可能为空
+                "sub_type": "group_recall",
+                "message_id": "<被撤回消息 ID>",
+                "recalled_user_info": {         # 被撤回消息的原作者（可能为空）
+                    "user_id": ...,
+                    "user_nickname": ...,
+                    "user_cardname": ...
+                }
             }
-        操作者（谁撤回了消息）信息在 message.message_base_info 中。
+        操作者（谁按了撤回）信息在 message.message_base_info 中。
+
+        显示逻辑（target_name）：
+            - 若 recalled_user_info 存在且 recalled_id != operator_id
+              （即管理员撤回他人消息），则显示「被撤回人」的名称
+            - 否则（自己撤回自己），显示操作者名称
 
         Returns:
-            (operator_name, operator_id, group_id, platform) 四元组，若非撤回事件则返回 None
+            (target_name, operator_id, group_id, platform) 四元组，若非撤回事件则返回 None
         """
         segs = message.message_segments
         if not segs:
@@ -145,12 +157,9 @@ class RecallEventHandler(BaseEventHandler):
 
         seg = segs[0]
 
-        # 检查是否为 notify 类型的消息段
         if getattr(seg, "type", None) != "notify":
             return None
 
-        # 检查 sub_type 是否为撤回事件
-        # Napcat 发来的撤回事件 sub_type 为 "group_recall"（而非通用的 "recall"）
         data = getattr(seg, "data", None)
         if not isinstance(data, dict):
             return None
@@ -158,22 +167,38 @@ class RecallEventHandler(BaseEventHandler):
         if sub_type not in ("recall", "group_recall"):
             return None
 
-        # 从基础信息中提取操作者信息（优先显示群名片，其次昵称，最后 ID）
+        # 操作者信息（按下撤回的人）
         base_info = message.message_base_info
-        operator_name: str = (
-            base_info.get("user_cardname")
-            or base_info.get("user_nickname")
-            or str(base_info.get("user_id", "某人"))
-        )
         operator_id: str = str(base_info.get("user_id", ""))
         group_id: str = str(base_info.get("group_id", ""))
         platform: str = str(base_info.get("platform", "qq"))
 
-        # group_id 为空则无法后续处理，跳过
         if not group_id:
             return None
 
-        return operator_name, operator_id, group_id, platform
+        # 被撤回消息的原作者信息
+        recalled_info = data.get("recalled_user_info") or {}
+        recalled_id: str = str(recalled_info.get("user_id", ""))
+
+        # 决定显示哪个人的名字：
+        # 若管理员撤回他人消息（recalled_id 有效且与 operator_id 不同），
+        # 则调侃指向「被撤回的那个人」而不是管理员
+        if recalled_id and recalled_id != operator_id:
+            target_name: str = (
+                recalled_info.get("user_cardname")
+                or recalled_info.get("user_nickname")
+                or recalled_id
+            )
+        else:
+            target_name = (
+                base_info.get("user_cardname")
+                or base_info.get("user_nickname")
+                or operator_id
+                or "某人"
+            )
+
+        return target_name, operator_id, group_id, platform
+
 
     async def _handle_recall_response(
         self,
@@ -187,11 +212,11 @@ class RecallEventHandler(BaseEventHandler):
         按顺序执行：
             1. 概率抽签（先于冷却，未命中就不消耗冷却）
             2. 冷却检查（防止同群短时间内多次响应）
-            3. 锁定冷却时间戳
-            4. 通过官方 chat_api 获取该群的 ChatStream / stream_id
-            5. 随机确定状态后缀（绝望/开心）
-            6. 通过 generator_api 生成动作描述
-            7. 拼装格式字符串并发送
+            3. 随机确定状态后缀（绝望/开心）
+            4. 动作描述来源：
+               - fixed_responses 非空 → 随机选一条（定型文，无 LLM）
+               - fixed_responses 为空 → 用 generator_api 动态生成
+            5. 拼装格式字符串并发送
         """
         try:
             # ── 读取配置 ───────────────────────────────
@@ -219,20 +244,8 @@ class RecallEventHandler(BaseEventHandler):
                 )
                 return
 
-            # 立即锁定冷却：无论后续是否发送成功，本次触发都消耗一次冷却
+            # 立即锁定冷却
             _last_response_time[group_id] = now
-
-            # ── 获取聊天流 & stream_id（官方 chat_api）──────
-            # chat_api.get_stream_by_group_id 封装了底层遍历逻辑，有日志和错误处理
-            chat_stream = chat_api.get_stream_by_group_id(group_id, platform)
-            if not chat_stream:
-                logger.warning(
-                    f"[recall_response] 找不到群 {group_id} 的聊天流，跳过"
-                    "（可能该群从未发过消息，或 MaiBot 尚未加载该群的聊天流）"
-                )
-                return
-
-            stream_id = chat_stream.stream_id
 
             # ── 状态后缀确定 ──────────────────────────
             desperate_prob: float = self.get_config(
@@ -240,14 +253,31 @@ class RecallEventHandler(BaseEventHandler):
             )
             status_suffix = "绝望" if random.random() < desperate_prob else "开心"
 
-            # ── 生成动作描述（官方 generator_api）──────────
-            # generate_response_custom 使用麦麦自身的 replyer 模型生成符合人设的文字
-            action_desc = await self._generate_response(
-                operator_name=operator_name,
-                chat_stream=chat_stream,
-            )
+            # ── 获取聊天流（两条路径都需要 stream_id 发送消息）─
+            chat_stream = chat_api.get_stream_by_group_id(group_id, platform)
+            if not chat_stream:
+                logger.warning(
+                    f"[recall_response] 找不到群 {group_id} 的聊天流，跳过"
+                    "（可能该群从未发过消息，或 MaiBot 尚未加载该群的聊天流）"
+                )
+                return
+            stream_id = chat_stream.stream_id
+
+            # ── 动作描述：定型文优先，否则使用 LLM ──────
+            fixed_responses: list = self.get_config("recall_response.fixed_responses", [])
+            if fixed_responses:
+                # 从配置的定型文列表中随机选一条，无需调用 LLM
+                action_desc: Optional[str] = str(random.choice(fixed_responses))
+                logger.debug(f"[recall_response] 使用定型文：{action_desc!r}")
+            else:
+                # 定型文列表为空，走 generator_api 生成路径
+                action_desc = await self._generate_response(
+                    operator_name=operator_name,
+                    chat_stream=chat_stream,
+                )
+
             if not action_desc:
-                logger.debug("[recall_response] LLM 未生成有效内容，跳过本次响应")
+                logger.debug("[recall_response] 未生成有效内容，跳过本次响应")
                 return
 
             response_text = f"{operator_name}：{action_desc}（{status_suffix}地撤回）"
@@ -400,7 +430,17 @@ class RecallResponsePlugin(BasePlugin):
                 type=str,
                 input_type="textarea",
                 default="用第三人称描述撤回人的动作或心态，内容可以是吐槽对方发错群、暴露XP、说了蠢话等",
-                description="描述撤回人行为风格指引，直接嵌入 LLM 提示词。",
+                description="（LLM 模式）描述撤回人行为风格指引，直接嵌入 LLM 提示词。fixed_responses 非空时此项无效。",
+            ),
+            "fixed_responses": ConfigField(
+                type=list,
+                default=[],
+                item_type="string",
+                description=(
+                    "定型文列表：非空时每次响应从列表中随机选一条，不再调用 LLM。"
+                    "留空则使用 LLM 动态生成。"
+                    "示例：['hide...', '好时代，来临了...', '撤回了不该说的话']"
+                ),
             ),
         },
     }
