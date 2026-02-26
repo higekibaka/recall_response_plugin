@@ -1,0 +1,27 @@
+{
+  "manifest_version": 1,
+  "name": "撤回消息响应插件",
+  "version": "1.0.0",
+  "description": "检测群聊撤回事件，有概率让麦麦发出一句符合人设的自然反应",
+  "author": {
+    "name": "higekibaka",
+    "url": "https://github.com/higekibaka"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.12.0"
+  },
+  "homepage_url": "https://github.com/higekibaka/recall_response_plugin",
+  "repository_url": "https://github.com/higekibaka/recall_response_plugin",
+  "keywords": [
+    "撤回",
+    "群组",
+    "互动",
+    "LLM"
+  ],
+  "categories": [
+    "Entertainment & Interaction"
+  ],
+  "default_locale": "zh-CN",
+  "id": "higekibaka.recall_response_plugin"
+}
