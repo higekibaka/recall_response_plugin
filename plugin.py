@@ -1,5 +1,5 @@
 """
-撤回消息响应插件 (recall_response_plugin)
+撤回消息响应插件 (recall_response_plugin) 
 ==========================================
 
 功能：
