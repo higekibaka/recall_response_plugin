@@ -4,13 +4,13 @@
 
 功能：
     监听群聊中的消息撤回事件，按照概率格式化输出对撤回事件的调侃反应。
-    反应格式固定为：{{撤回人名称}}：{{十个字左右的动作描述}}（{{绝望/开心}}地撤回）
-    其中“动作描述”由 LLM 根据当前群聊上下文及被撤回信息的想象进行生成。
+    反应格式固定为：{撤回人名称}：{十个字左右的动作描述}（{绝望/开心}地撤回）
+    其中"动作描述"由 LLM 通过官方 generator_api 结合人设和群聊上下文生成。
 
 工作原理：
     1. 通过 ON_MESSAGE_PRE_PROCESS 事件钩子，拦截所有进入系统的消息（含 notice 类型）
     2. 检测消息段（message_segments）中类型为 "notify"、sub_type 为 "recall" 的段
-    3. 满足条件后：进行概率抽签 → 检查冷却时间 → 根据概率确定情绪状态后缀 → 调用 LLM 生成动作描述 → 拼接格式发送
+    3. 满足条件后：概率抽签 → 冷却检查 → 根据概率确定状态后缀 → 调用 generator_api 生成动作描述 → 拼接格式发送
     4. 全程异步执行，不阻塞消息的正常处理流程
 
 注意：
@@ -21,6 +21,7 @@
 
 import asyncio
 import random
+import re
 import time
 from typing import List, Optional, Tuple, Type
 
@@ -31,11 +32,10 @@ from src.plugin_system import (
     ConfigField,
     EventType,
     MaiMessages,
-    message_api,
-    register_plugin,
-    llm_api,
     send_api,
+    register_plugin,
 )
+from src.plugin_system.apis import chat_api, generator_api
 from src.plugin_system.base.component_types import ComponentInfo
 from src.config.config import global_config
 
@@ -47,6 +47,9 @@ logger = get_logger("recall_response_plugin")
 # value: 上次成功响应的时间戳 (float, UNIX time)
 # ─────────────────────────────────────────────
 _last_response_time: dict[str, float] = {}
+
+# 文本清洗用正则：移除括号包裹的注释或情绪标注
+_BRACKET_RE = re.compile(r'（[^）]*）|\([^)]*\)|\[[^\]]*\]|【[^】]*】')
 
 
 class RecallEventHandler(BaseEventHandler):
@@ -104,7 +107,6 @@ class RecallEventHandler(BaseEventHandler):
         )
 
         # 异步触发响应逻辑，不阻塞当前消息处理流程
-        # asyncio.create_task 会在当前事件循环中创建独立 Task
         asyncio.create_task(
             self._handle_recall_response(
                 operator_name=operator_name,
@@ -133,9 +135,6 @@ class RecallEventHandler(BaseEventHandler):
                 "recalled_user_info": { "user_id": ..., "user_nickname": ... }  # 可能为空
             }
         操作者（谁撤回了消息）信息在 message.message_base_info 中。
-
-        Args:
-            message: 经过 events_manager 转换后的 MaiMessages 对象
 
         Returns:
             (operator_name, operator_id, group_id, platform) 四元组，若非撤回事件则返回 None
@@ -186,11 +185,13 @@ class RecallEventHandler(BaseEventHandler):
         实际的响应处理逻辑（异步执行）
 
         按顺序执行：
-            1. 冷却检查（先于概率，防止连续撤回连续响应）
-            2. 概率抽签
-            3. 查找该群的 stream_id
-            4. 调用 LLM 生成反应文字
-            5. 发送纯文本消息
+            1. 概率抽签（先于冷却，未命中就不消耗冷却）
+            2. 冷却检查（防止同群短时间内多次响应）
+            3. 锁定冷却时间戳
+            4. 通过官方 chat_api 获取该群的 ChatStream / stream_id
+            5. 随机确定状态后缀（绝望/开心）
+            6. 通过 generator_api 生成动作描述
+            7. 拼装格式字符串并发送
         """
         try:
             # ── 读取配置 ───────────────────────────────
@@ -201,9 +202,14 @@ class RecallEventHandler(BaseEventHandler):
                 "recall_response.cooldown_seconds", 60
             )
 
-            # ── 冷却检查（必须在概率抽签之前）───────────────
-            # 只要群在冷却期内就直接跳过，无论概率如何
-            # 这样可以防止「连续多次撤回 + 每次概率命中」导致突击响应
+            # ── 概率抽签（先于冷却，未触发时不消耗冷却次数）──
+            if random.random() > response_probability:
+                logger.debug(
+                    f"[recall_response] 概率未命中（{response_probability:.0%}），本次不响应"
+                )
+                return
+
+            # ── 冷却检查 ─────────────────────────────────
             now = time.time()
             last_time = _last_response_time.get(group_id, 0.0)
             remaining = cooldown_seconds - (now - last_time)
@@ -213,25 +219,20 @@ class RecallEventHandler(BaseEventHandler):
                 )
                 return
 
-            # 立即锁定冷却：无论后续 LLM/发送是否成功，本次触发都消耗一次冷却
-            # 这样同一群在冷却期内的后续撤回都会被跳过
+            # 立即锁定冷却：无论后续是否发送成功，本次触发都消耗一次冷却
             _last_response_time[group_id] = now
 
-            # ── 概率抽签 ───────────────────────────────
-            if random.random() > response_probability:
-                logger.debug(
-                    f"[recall_response] 概率未命中（{response_probability:.0%}），本次不响应"
-                )
-                return
-
-            # ── 获取 stream_id ─────────────────────────
-            stream_id = self._get_stream_id(group_id)
-            if not stream_id:
+            # ── 获取聊天流 & stream_id（官方 chat_api）──────
+            # chat_api.get_stream_by_group_id 封装了底层遍历逻辑，有日志和错误处理
+            chat_stream = chat_api.get_stream_by_group_id(group_id, platform)
+            if not chat_stream:
                 logger.warning(
-                    f"[recall_response] 找不到群 {group_id} 的 stream_id，跳过"
+                    f"[recall_response] 找不到群 {group_id} 的聊天流，跳过"
                     "（可能该群从未发过消息，或 MaiBot 尚未加载该群的聊天流）"
                 )
                 return
+
+            stream_id = chat_stream.stream_id
 
             # ── 状态后缀确定 ──────────────────────────
             desperate_prob: float = self.get_config(
@@ -239,10 +240,11 @@ class RecallEventHandler(BaseEventHandler):
             )
             status_suffix = "绝望" if random.random() < desperate_prob else "开心"
 
-            # ── LLM 生成反应 ──────────────────────────
+            # ── 生成动作描述（官方 generator_api）──────────
+            # generate_response_custom 使用麦麦自身的 replyer 模型生成符合人设的文字
             action_desc = await self._generate_response(
                 operator_name=operator_name,
-                stream_id=stream_id,
+                chat_stream=chat_stream,
             )
             if not action_desc:
                 logger.debug("[recall_response] LLM 未生成有效内容，跳过本次响应")
@@ -254,7 +256,6 @@ class RecallEventHandler(BaseEventHandler):
             success = await send_api.text_to_stream(response_text, stream_id)
 
             if success:
-                # 冷却时间戳已在检查时更新，此处只记录日志
                 logger.info(
                     f"[recall_response] ✅ 已响应撤回（群 {group_id}）：{response_text!r}"
                 )
@@ -268,125 +269,69 @@ class RecallEventHandler(BaseEventHandler):
         except Exception as e:
             logger.error(f"[recall_response] 处理撤回响应时发生异常：{e}", exc_info=True)
 
-    def _get_stream_id(self, group_id: str) -> Optional[str]:
-        """
-        通过 group_id 在 chat_manager 中查找对应的 stream_id
-
-        chat_manager.streams 是一个 {stream_id: ChatStream} 的字典，
-        每个 ChatStream 的 group_info.group_id 记录了对应的群号。
-
-        Args:
-            group_id: 群号字符串
-
-        Returns:
-            对应的 stream_id，找不到则返回 None
-        """
-        try:
-            from src.chat.message_receive.chat_stream import get_chat_manager
-
-            chat_manager = get_chat_manager()
-            for stream_id, stream in chat_manager.streams.items():
-                if (
-                    hasattr(stream, "group_info")
-                    and stream.group_info
-                    and str(stream.group_info.group_id) == str(group_id)
-                ):
-                    return stream_id
-            return None
-        except Exception as e:
-            logger.error(f"[recall_response] 查找 stream_id 失败：{e}")
-            return None
-
     async def _generate_response(
         self,
         operator_name: str,
-        stream_id: str,
+        chat_stream,  # ChatStream
     ) -> Optional[str]:
         """
-        调用 LLM 生成符合人设的撤回反应文字
+        调用 generator_api 生成符合人设的撤回动作描述
 
         流程：
-            1. 获取该群最近 30 分钟的聊天记录（最多 6 条）作为上下文
-            2. 构造 prompt，注入麦麦的人设和群聊上下文
-            3. 调用 utils 模型（轻量小模型，适合短文本生成）
-            4. 对输出做简单清洗（去除引号、截取第一句）
+            1. 构造 prompt，描述撤回事件和要求的输出格式
+            2. 通过 generator_api.generate_response_custom 用 replyer 模型生成
+               （replyer 模型天生携带麦麦人设和群聊上下文，无需手动注入）
+            3. 对输出做简单清洗（去除引号、括号注释，截取第一句）
 
         Args:
             operator_name: 执行撤回操作的用户名
-            stream_id:     对应群的 stream_id，用于获取聊天记录
+            chat_stream:   对应群的 ChatStream 对象（携带上下文）
 
         Returns:
-            生成的一句话字符串，生成失败则返回 None
+            生成的动作描述字符串，生成失败则返回 None
         """
         try:
-            # ── 获取聊天上下文 ────────────────────────
-            recent_messages = message_api.get_recent_messages(
-                chat_id=stream_id,
-                hours=0.5,   # 最近 30 分钟
-                limit=6,     # 最多 6 条
-            )
-            context_str = message_api.build_readable_messages_to_str(
-                recent_messages,
-                replace_bot_name=True,          # 用 bot 名字替代 ID
-                timestamp_mode="relative",       # 相对时间（如"3分钟前"）
-            )
-
-            bot_name: str = global_config.bot.nickname or "麦麦"
-            personality: str = global_config.personality.personality or ""
-            # 从插件配置读取响应风格定制指引
             response_style: str = self.get_config(
                 "recall_response.response_style",
-                '用第三人称描述撤回人的动作或心态，内容可以是吐槽对方发错群、暴露XP、说了蠢话等',
+                "用第三人称描述撤回人的动作或心态，内容可以是吐槽对方发错群、暴露XP、说了蠢话等",
             )
 
-            # ── 构造 Prompt ──────────────────────────────
-            prompt = f"""你是{bot_name}，{personality}
+            # ── 构造 Prompt ───────────────────────────────
+            # generator_api 的 replyer 模型会自动携带麦麦人设和聊天记录，
+            # 这里 prompt 只需要描述本次任务指令即可
+            prompt = f"""群里 {operator_name} 刚刚撤回了一条消息。
 
-当前群聊的最近消息（作为上下文参考）：
-{context_str if context_str else "（暂无记录）"}
-
-事件：{operator_name} 刚刚撤回了一条消息。
-
-请以你的视角和人设脑回路，去想象或揣测【{operator_name}】撤回这条消息的原因（TA做出了什么动作或处于什么心态）。
+请以你的视角和人设脑回路，想象或揣测【{operator_name}】撤回这条消息的原因（TA做出了什么动作或处于什么心态）。
 生成一句约十个字的【动作描述】。
 
 要求：
-- 只输出是对撤回人行为/原因的描述，不加任何前缀、序号、标点或括号
-- 具体描述风格参考：{response_style}
-- 约8-15个汉字长度，比如：发现自己暴露了XP / 撤回了刚才的暴言 / 肯定又发错群了"""
+- 只输出对撤回人行为/心态的描述，不加任何前缀、序号、标点或括号
+- 描述风格参考：{response_style}
+- 约8-15个汉字长度，例如：发现自己暴露了XP / 撤回了刚才的暴言 / 肯定又发错群了"""
 
-            # ── 调用 utils 模型 ─────────────────────
-            # utils 是轻量模型，适合这种简单短文本生成任务
-            available_models = llm_api.get_available_models()
-            utils_config = available_models.get("utils")
-            if not utils_config:
-                logger.warning("[recall_response] utils 模型不可用，跳过")
-                return None
-
-            success, response, _, _ = await llm_api.generate_with_model(
-                prompt=prompt,
-                model_config=utils_config,
+            # ── 调用 generator_api ──────────────────────
+            response = await generator_api.generate_response_custom(
+                chat_stream=chat_stream,
                 request_type="plugin.recall_response",
+                prompt=prompt,
             )
 
-            if not success or not response:
-                logger.warning(f"[recall_response] LLM 调用失败：{response!r}")
+            if not response:
+                logger.warning("[recall_response] generator_api 返回空内容")
                 return None
 
-            # ── 清洗输出 ─────────────────────────────
-            response = response.strip().strip('"\'""')
-            
-            # 移除可能带有括号的情绪标注或者无关描述
-            import re
-            response = re.sub(r'\\（.*?\\）|\\(.*?\\)|\\[.*?\\]|\\【.*?\\】', '', response)
-            response = response.strip()
+            # ── 清洗输出 ──────────────────────────────
+            response = response.strip().strip('"\'"「」')
+
+            # 移除模型附带的情绪标注括号（如"（笑）"）
+            response = _BRACKET_RE.sub("", response).strip()
 
             # 若模型输出了多句话，只取第一句
             if len(response) > 50:
                 for sep in ["。", "！", "？", "…", "\n", "，", ","]:
                     idx = response.find(sep)
                     if idx != -1:
-                        response = response[: idx]
+                        response = response[:idx]
                         break
                 else:
                     response = response[:20]  # 兜底截断
